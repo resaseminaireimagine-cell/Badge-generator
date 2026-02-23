@@ -11,7 +11,7 @@ import streamlit.components.v1 as components
 from PIL import Image, ImageDraw, ImageOps
 
 from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib.colors import HexColor
 from reportlab.lib.utils import ImageReader
@@ -22,7 +22,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 # =========================
 # CONFIG / CHARTE IMAGINE
 # =========================
-APP_TITLE = "Badge generator — Imagine (A4, Recto/Verso)"
+APP_TITLE = "Badge generator — Imagine (A4, 4×A6, Recto/Verso)"
 IMAGINE_ROSE = "#C4007A"
 BLACK = "#0B1220"
 WHITE = "#FFFFFF"
@@ -30,7 +30,7 @@ BAND_DEFAULT = "#C9C4A6"
 
 ROOT = Path(__file__).parent
 ASSETS = ROOT / "assets"
-CENTER_IMAGE_PATH = ASSETS / "center_image.jpg"
+CENTER_IMAGE_PATH = ASSETS / "center_image.jpg"  # image microscope fixe
 
 FONT_REG = ASSETS / "Montserrat-Regular.ttf"
 FONT_BOLD = ASSETS / "Montserrat-Bold.ttf"
@@ -52,9 +52,6 @@ def _download(url: str, dest: Path) -> bool:
 
 
 def ensure_fonts() -> Tuple[Dict[str, str], str]:
-    """
-    Retourne (fonts_map, status_str)
-    """
     fonts = {"regular": "Helvetica", "bold": "Helvetica-Bold"}
     status = "Helvetica (fallback)"
 
@@ -105,8 +102,11 @@ def make_circle_image(img: Image.Image, diameter_px: int, remove_black: bool, th
     if remove_black:
         img = remove_near_black_to_transparent(img, threshold=threshold)
 
-    # Fit (pas de crop sauvage)
+    # FIT (pas de crop)
     w, h = img.size
+    if w == 0 or h == 0:
+        return Image.new("RGBA", (diameter_px, diameter_px), (0, 0, 0, 0))
+
     scale = min(diameter_px / w, diameter_px / h)
     nw, nh = int(w * scale), int(h * scale)
     img = img.resize((nw, nh), Image.LANCZOS)
@@ -146,70 +146,92 @@ def fit_font_size(c: canvas.Canvas, text: str, font: str, max_w: float, start: i
     return max(size, min_size)
 
 
-def lines(text: str) -> List[str]:
+def split_lines(text: str) -> List[str]:
     return [t.strip() for t in (text or "").split("\n") if t.strip()]
+
+
+def safe_str(v) -> str:
+    return "" if v is None else str(v).strip()
 
 
 # =========================
 # DESIGN
 # =========================
 @dataclass
-class BadgeDesign:
-    # "badge" de base = A5 (148x210)
-    badge_w_mm: float = 148
-    badge_h_mm: float = 210
-    band_ratio: float = 0.28
-
+class Design:
     bg_black: str = BLACK
     band_color: str = BAND_DEFAULT
     accent: str = IMAGINE_ROSE
 
-    margin_mm: float = 8  # un poil plus serré
-    circle_d_mm: float = 62
-    circle_y_offset_mm: float = -6  # mieux centré
+    band_ratio: float = 0.28
+    inner_margin_mm: float = 6
 
-    # tailles
-    date_big: int = 22
-    date_small: int = 12
-    edition_size: int = 10
-    title_size: int = 20
-    tagline_size: int = 10
-    organised_by_size: int = 7
-    role_size: int = 16
+    # base font sizes (A6 print-safe)
+    date_big: int = 14
+    date_small: int = 9
+    edition_size: int = 8
+
+    event_title_size: int = 18
+    baseline_size: int = 10
+
+    organised_by_size: int = 6
+
+    band_text_size: int = 12
+
+    # image
+    circle_d_mm: float = 58
+    circle_y_offset_mm: float = -2
 
 
 # =========================
-# LAYOUT A4 UNIQUEMENT
+# A4 -> 4 badges (A6 ratio) print-safe
 # =========================
-def layout_positions(layout_name: str, margin_mm: float, gap_mm: float) -> Tuple[Tuple[float, float], Tuple[float, float], List[Tuple[float, float]]]:
+def compute_a4_4up_layout(page_margin_mm: float, gap_mm: float) -> Tuple[Tuple[float, float], Tuple[float, float], List[Tuple[float, float]]]:
     """
-    A4 uniquement.
-    - "A4 paysage — 2 badges (GRAND)" => 2 x A5 (148x210) côte à côte, nickel.
-    - "A4 portrait — 4 badges (PETIT)" => 4 x A6 (105x148).
+    A4 portrait.
+    On calcule une taille badge basée sur le ratio A6 (105×148),
+    en garantissant que ça rentre avec marge + gap.
     """
-    m = margin_mm * mm
+    page_w, page_h = A4
+    m = page_margin_mm * mm
     g = gap_mm * mm
 
-    if layout_name == "A4 paysage — 2 badges (GRAND)":
-        page_w, page_h = landscape(A4)
-        badge_w, badge_h = 148 * mm, 210 * mm
-        # 2 colonnes, 1 ligne
-        positions = [
-            (m, page_h - m - badge_h),
-            (m + badge_w + g, page_h - m - badge_h),
-        ]
-        return (page_w, page_h), (badge_w, badge_h), positions
+    # contraintes : 2 colonnes, 2 lignes
+    max_w_per_col = (page_w - 2 * m - g) / 2
+    max_h_per_row = (page_h - 2 * m - g) / 2
 
-    # 4-up (A6) sur A4 portrait
-    page_w, page_h = A4
-    badge_w, badge_h = 105 * mm, 148 * mm
-    positions = [
-        (m, page_h - m - badge_h),
-        (m + badge_w + g, page_h - m - badge_h),
-        (m, page_h - m - 2 * badge_h - g),
-        (m + badge_w + g, page_h - m - 2 * badge_h - g),
-    ]
+    # ratio A6
+    ratio_w_h = 105 / 148
+
+    # derive badge size from both constraints
+    w_from_width = max_w_per_col
+    h_from_width = w_from_width / ratio_w_h
+
+    h_from_height = max_h_per_row
+    w_from_height = h_from_height * ratio_w_h
+
+    # choose the limiting size
+    badge_w = min(w_from_width, w_from_height)
+    badge_h = badge_w / ratio_w_h
+
+    # positions 2x2
+    x1 = m
+    x2 = m + badge_w + g
+    y1 = page_h - m - badge_h
+    y2 = page_h - m - 2 * badge_h - g
+
+    positions = [(x1, y1), (x2, y1), (x1, y2), (x2, y2)]
     return (page_w, page_h), (badge_w, badge_h), positions
+
+
+def draw_cut_marks(c: canvas.Canvas, x: float, y: float, w: float, h: float):
+    c.setStrokeColor(HexColor("#9CA3AF"))
+    c.setLineWidth(0.3)
+    L = 4 * mm
+    c.line(x, y, x + L, y); c.line(x, y, x, y + L)
+    c.line(x + w, y, x + w - L, y); c.line(x + w, y, x + w, y + L)
+    c.line(x, y + h, x + L, y + h); c.line(x, y + h, x, y + h - L)
+    c.line(x + w, y + h, x + w - L, y + h); c.line(x + w, y + h, x + w, y + h - L)
 
 
 # =========================
@@ -218,56 +240,83 @@ def layout_positions(layout_name: str, margin_mm: float, gap_mm: float) -> Tuple
 def draw_recto(
     c: canvas.Canvas,
     fonts: Dict[str, str],
-    design: BadgeDesign,
+    d: Design,
     x: float,
     y: float,
-    badge_w: float,
-    badge_h: float,
+    bw: float,
+    bh: float,
     cfg: dict,
     person: dict,
     center_img: Image.Image,
     sponsor_imgs: List[Image.Image],
 ):
-    # proportions band bas
-    band_h = badge_h * design.band_ratio
-    top_h = badge_h - band_h
-    pad = 6 * mm
-    margin = design.margin_mm * mm
+    band_h = bh * d.band_ratio
+    top_h = bh - band_h
+    pad = 4 * mm
+    inner = d.inner_margin_mm * mm
 
-    # fonds
-    c.setFillColor(HexColor(design.bg_black))
-    c.rect(x, y + band_h, badge_w, top_h, stroke=0, fill=1)
-    c.setFillColor(HexColor(design.band_color))
-    c.rect(x, y, badge_w, band_h, stroke=0, fill=1)
+    # backgrounds
+    c.setFillColor(HexColor(d.bg_black))
+    c.rect(x, y + band_h, bw, top_h, stroke=0, fill=1)
+    c.setFillColor(HexColor(d.band_color))
+    c.rect(x, y, bw, band_h, stroke=0, fill=1)
 
-    # ---- date top-left (vraiment en haut)
+    # date top-left (bien en haut)
     if cfg["show_date"]:
         bx = x + pad
-        by = y + badge_h - pad - 18 * mm  # plus haut
+        by = y + bh - pad - 16 * mm
 
         c.setFillColor(HexColor(WHITE))
-        c.setFont(fonts["bold"], design.date_big)
-        c.drawString(bx, by + 9 * mm, cfg["date_l1"])
+        c.setFont(fonts["bold"], d.date_big)
+        c.drawString(bx, by + 7 * mm, cfg["date_l1"])
 
-        c.setFont(fonts["regular"], design.date_small)
-        c.drawString(bx, by + 3.5 * mm, cfg["date_l2"])
+        c.setFont(fonts["regular"], d.date_small)
+        c.drawString(bx, by + 2.5 * mm, cfg["date_l2"])
         c.drawString(bx, by - 2.0 * mm, cfg["date_l3"])
 
-        c.setFillColor(HexColor(design.accent))
-        c.rect(bx, by + 1.2 * mm, 10 * mm, 1.2 * mm, stroke=0, fill=1)
+        c.setFillColor(HexColor(d.accent))
+        c.rect(bx, by + 0.7 * mm, 10 * mm, 1.1 * mm, stroke=0, fill=1)
 
-    # ---- édition top-right (vraiment en haut à droite)
+    # edition top-right (bien en haut à droite)
     if cfg["show_edition"] and cfg["edition_text"].strip():
         c.setFillColor(HexColor(WHITE))
-        c.setFont(fonts["regular"], design.edition_size)
-        c.drawRightString(x + badge_w - pad, y + badge_h - pad - 5 * mm, cfg["edition_text"].strip())
+        c.setFont(fonts["regular"], d.edition_size)
+        c.drawRightString(x + bw - pad, y + bh - pad - 3.5 * mm, cfg["edition_text"].strip())
 
-    # ---- cercle image (centré)
+    # title + baseline (plus gros, lisible, AU-DESSUS de l'image)
+    ccx = x + bw / 2
+    title_lines = split_lines(cfg["event_title"])[:2]
+    baseline = cfg["baseline"].strip()
+
+    # zone titre : entre le haut et l'image
+    title_top = y + band_h + top_h - 22 * mm
+    title_max_w = bw - 2 * inner
+
+    if cfg["show_event_title"] and title_lines:
+        # ajuste taille sur ligne la plus longue
+        longest = max(title_lines, key=len)
+        tsize = fit_font_size(c, longest, fonts["bold"], title_max_w, cfg["event_title_size"], min_size=10)
+
+        c.setFillColor(HexColor(WHITE))
+        c.setFont(fonts["bold"], tsize)
+        lh = (tsize + 3) * 0.85
+        ty = title_top
+
+        for ln in title_lines:
+            c.drawCentredString(ccx, ty, ln)
+            ty -= lh
+
+        if cfg["show_baseline"] and baseline:
+            c.setFillColor(HexColor(d.accent))
+            bsize = fit_font_size(c, baseline, fonts["bold"], title_max_w, cfg["baseline_size"], min_size=7)
+            c.setFont(fonts["bold"], bsize)
+            c.drawCentredString(ccx, ty - 2 * mm, baseline)
+
+    # microscope circle (plus gros, centré)
     circle_d = cfg["circle_d_mm"] * mm
-    ccx = x + badge_w / 2
-    ccy = y + band_h + top_h * 0.55 + (cfg["circle_y_offset_mm"] * mm)
+    ccy = y + band_h + top_h * 0.50 + (cfg["circle_y_offset_mm"] * mm)
 
-    dpx = int(cfg["circle_d_mm"] * 12)
+    dpx = int(cfg["circle_d_mm"] * 14)  # un peu plus net
     circ = make_circle_image(center_img, dpx, cfg["remove_black_bg"], cfg["black_threshold"])
     c.drawImage(
         pil_to_reader(circ),
@@ -278,248 +327,162 @@ def draw_recto(
         mask="auto",
     )
 
-    # ---- titre & tagline (centrés, fit)
-    if cfg["show_title"]:
-        title = cfg["event_title"].strip()
-        title_lines = lines(title)[:3]
-        c.setFillColor(HexColor(WHITE))
-
-        # largeur max = 0.9 du cercle
-        max_w = circle_d * 0.9
-        base_size = design.title_size
-
-        # Ajuste taille sur la ligne la plus longue
-        longest = max(title_lines, key=len) if title_lines else ""
-        tsize = fit_font_size(c, longest, fonts["bold"], max_w, base_size, min_size=12)
-
-        c.setFont(fonts["bold"], tsize)
-        lh = (tsize + 3) * 0.9
-        total_h = lh * len(title_lines)
-        ty = ccy + total_h / 2 - lh
-
-        for ln in title_lines:
-            c.drawCentredString(ccx, ty, ln)
-            ty -= lh
-
-        if cfg["show_tagline"] and cfg["event_tagline"].strip():
-            tag = cfg["event_tagline"].strip()
-            c.setFillColor(HexColor(design.accent))
-            tag_size = min(design.tagline_size, max(8, tsize - 10))
-            tag_size = fit_font_size(c, tag, fonts["bold"], max_w, tag_size, min_size=7)
-            c.setFont(fonts["bold"], tag_size)
-            c.drawCentredString(ccx, ccy - circle_d * 0.28, tag)
-
-    # ---- sponsors
+    # sponsors (optionnel)
     if cfg["show_sponsors"] and sponsor_imgs:
         if cfg["show_organised_by"] and cfg["organised_by_label"].strip():
             c.setFillColor(HexColor(WHITE))
-            c.setFont(fonts["regular"], design.organised_by_size)
-            c.drawString(x + margin, y + band_h + 20 * mm, cfg["organised_by_label"].strip())
+            c.setFont(fonts["regular"], d.organised_by_size)
+            c.drawString(x + inner, y + band_h + 18 * mm, cfg["organised_by_label"].strip())
 
         logos = sponsor_imgs[: cfg["max_sponsors"]]
         n = len(logos)
-        gap = 2.5 * mm
-        box_h = 12 * mm
-        avail_w = badge_w - 2 * margin - gap * (n - 1)
+        gap = 2.0 * mm
+        box_h = 10 * mm
+        avail_w = bw - 2 * inner - gap * (n - 1)
         box_w = avail_w / n
         box_y = y + band_h + 6 * mm
 
         for i, lg in enumerate(logos):
-            bx = x + margin + i * (box_w + gap)
+            bx = x + inner + i * (box_w + gap)
             c.setFillColor(HexColor(WHITE))
             c.rect(bx, box_y, box_w, box_h, stroke=0, fill=1)
-            draw_image_fit(c, lg, bx + 1.2 * mm, box_y + 1.2 * mm, box_w - 2.4 * mm, box_h - 2.4 * mm)
+            draw_image_fit(c, lg, bx + 1.0 * mm, box_y + 1.0 * mm, box_w - 2.0 * mm, box_h - 2.0 * mm)
 
-    # ---- bande basse : catégorie (fit pour éviter débordement)
-    if cfg["show_role_band"]:
-        if cfg["role_source"] == "Texte fixe":
-            role = cfg["role_fixed"].strip().upper()
+    # band text (ROLE ou NOM COMPLET)
+    if cfg["band_show"]:
+        if cfg["band_mode"] == "Catégorie (colonne)":
+            txt = safe_str(person.get(cfg["role_col"], "")).upper()
+        elif cfg["band_mode"] == "Nom complet":
+            txt = f"{safe_str(person.get(cfg['first_col'], ''))} {safe_str(person.get(cfg['last_col'], ''))}".strip().upper()
         else:
-            role = str(person.get(cfg["role_col"], "")).strip().upper()
+            txt = cfg["band_custom"].strip().upper()
 
-        if role:
-            max_w = badge_w - 2 * margin
+        if txt:
+            max_w = bw - 2 * inner
             c.setFillColor(HexColor("#111111"))
-            size = fit_font_size(c, role, fonts["bold"], max_w, design.role_size, min_size=8)
+            size = fit_font_size(c, txt, fonts["bold"], max_w, cfg["band_text_size"], min_size=7)
             c.setFont(fonts["bold"], size)
-            c.drawCentredString(x + badge_w / 2, y + band_h / 2 - 3 * mm, role)
+            c.drawCentredString(x + bw / 2, y + band_h / 2 - 2 * mm, txt)
 
 
 # =========================
-# DRAW VERSO (tout doit rentrer)
+# DRAW VERSO (toujours visible)
 # =========================
-def draw_verso(c: canvas.Canvas, fonts: Dict[str, str], design: BadgeDesign, x: float, y: float, badge_w: float, badge_h: float, cfg: dict):
-    c.setFillColor(HexColor(design.bg_black))
-    c.rect(x, y, badge_w, badge_h, stroke=0, fill=1)
+def draw_verso(c: canvas.Canvas, fonts: Dict[str, str], d: Design, x: float, y: float, bw: float, bh: float, cfg: dict):
+    c.setFillColor(HexColor(d.bg_black))
+    c.rect(x, y, bw, bh, stroke=0, fill=1)
 
-    margin = design.margin_mm * mm
-    usable_top = y + badge_h - margin
-    usable_bottom = y + margin + (18 * mm if cfg["back_show_hashtag"] else 0)
+    inner = d.inner_margin_mm * mm
+    top = y + bh - inner
+    bottom = y + inner + (14 * mm if cfg["back_show_hashtag"] else 0)
 
-    # compile sections
-    enabled_sections = []
+    # sections actives
+    sections = []
     for s in cfg["back_sections"]:
         if s["show"]:
             title = (s["title"] or "").strip().upper()
-            content_lines = lines(s["lines"])
-            if title or content_lines:
-                enabled_sections.append((title, content_lines))
+            content = split_lines(s["lines"])
+            if title or content:
+                sections.append((title, content))
 
-    # compute needed height with base sizes
-    title_size = 14
-    line_size = 11
-    title_gap = 8 * mm
-    line_gap = 6 * mm
-    section_gap = 8 * mm
-
-    # optional event name
-    header_h = 0
+    # header event name (optionnel)
+    cursor = top
     if cfg["back_show_event_name"] and cfg["back_event_name"].strip():
-        header_h = 18 * mm
+        c.setFillColor(HexColor(WHITE))
+        c.setFont(fonts["bold"], 11)
+        c.drawCentredString(x + bw / 2, cursor - 4 * mm, cfg["back_event_name"].strip()[:80])
+        cursor -= 14 * mm
 
-    def estimate_height(ts: int, ls: int) -> float:
-        h = header_h
-        for t, lns in enabled_sections:
-            if t:
-                h += (ts + 3) * 0.9 / 72 * 25.4 * mm  # approximate -> overkill not needed
-            # simpler fixed mm:
-            h += title_gap
-            h += len(lns) * line_gap
-            h += section_gap
-        return h
-
-    available = usable_top - usable_bottom - header_h
-
-    # scale down if needed
-    # (on garde simple : si trop long, on baisse les tailles jusqu'à rentrer)
+    # auto-fit simple : baisse tailles si trop long
+    title_size = 12
+    line_size = 9
     while True:
         needed = 0
-        for t, lns in enabled_sections:
-            if t:
-                needed += (title_size + 6) * 0.6 * mm
-            needed += len(lns) * (line_size + 5) * 0.45 * mm
-            needed += 7 * mm
-        if needed <= available or (title_size <= 11 and line_size <= 9):
+        for t, lns in sections:
+            needed += 8 * mm  # titre
+            needed += len(lns) * 5.5 * mm
+            needed += 6 * mm
+        if needed <= (cursor - bottom) or (title_size <= 10 and line_size <= 8):
             break
         title_size -= 1
         line_size -= 1
 
-    cursor_y = usable_top
-
-    # header event name
-    if cfg["back_show_event_name"] and cfg["back_event_name"].strip():
-        c.setFillColor(HexColor(WHITE))
-        c.setFont(fonts["bold"], 12)
-        c.drawCentredString(x + badge_w / 2, cursor_y - 6 * mm, cfg["back_event_name"].strip()[:80])
-        cursor_y -= header_h
-
-    # sections
-    for t, lns in enabled_sections:
-        if cursor_y < usable_bottom + 10 * mm:
+    for t, lns in sections:
+        if cursor < bottom + 10 * mm:
             break
-
         if t:
             c.setFillColor(HexColor(WHITE))
             c.setFont(fonts["bold"], title_size)
-            c.drawCentredString(x + badge_w / 2, cursor_y, t)
-            cursor_y -= 9 * mm
+            c.drawCentredString(x + bw / 2, cursor, t)
+            cursor -= 8 * mm
 
         c.setFont(fonts["regular"], line_size)
         for ln in lns:
-            c.drawCentredString(x + badge_w / 2, cursor_y, ln[:90])
-            cursor_y -= 6 * mm
+            c.drawCentredString(x + bw / 2, cursor, ln[:90])
+            cursor -= 5.5 * mm
 
-        cursor_y -= 8 * mm
+        cursor -= 6 * mm
 
-    # hashtag
     if cfg["back_show_hashtag"] and cfg["back_hashtag"].strip():
         c.setFillColor(HexColor(WHITE))
-        c.setFont(fonts["bold"], 14)
-        c.drawCentredString(x + badge_w / 2, y + 18 * mm, cfg["back_hashtag"].strip())
-
-
-def cut_marks(c: canvas.Canvas, x: float, y: float, w: float, h: float):
-    c.setStrokeColor(HexColor("#9CA3AF"))
-    c.setLineWidth(0.3)
-    L = 5 * mm
-    c.line(x, y, x + L, y); c.line(x, y, x, y + L)
-    c.line(x + w, y, x + w - L, y); c.line(x + w, y, x + w, y + L)
-    c.line(x, y + h, x + L, y + h); c.line(x, y + h, x, y + h - L)
-    c.line(x + w, y + h, x + w - L, y + h); c.line(x + w, y + h, x + w, y + h - L)
+        c.setFont(fonts["bold"], 12)
+        c.drawCentredString(x + bw / 2, y + 12 * mm, cfg["back_hashtag"].strip())
 
 
 # =========================
-# PDF GEN
+# PDF GENERATION
 # =========================
-def generate_pdf(df: pd.DataFrame, cfg: dict, design: BadgeDesign, sponsor_imgs: List[Image.Image]) -> bytes:
+def generate_pdf(df: pd.DataFrame, cfg: dict, sponsor_imgs: List[Image.Image]) -> bytes:
     fonts, _ = ensure_fonts()
-
-    if not CENTER_IMAGE_PATH.exists():
-        raise RuntimeError("assets/center_image.jpg introuvable")
 
     center_img = Image.open(CENTER_IMAGE_PATH)
 
-    (page_w, page_h), (badge_w, badge_h), positions = layout_positions(cfg["layout"], cfg["page_margin_mm"], cfg["gap_mm"])
+    (page_w, page_h), (bw, bh), positions = compute_a4_4up_layout(cfg["page_margin_mm"], cfg["gap_mm"])
 
-    # si layout 4-up, badge = A6 : on redimensionne le design (propre)
-    local_design = design
-    if cfg["layout"] == "A4 portrait — 4 badges (PETIT)":
-        local_design = BadgeDesign(
-            badge_w_mm=105,
-            badge_h_mm=148,
-            band_ratio=design.band_ratio,
-            bg_black=design.bg_black,
-            band_color=design.band_color,
-            accent=design.accent,
-            margin_mm=6,
-            circle_d_mm=max(42, design.circle_d_mm * 0.72),
-            circle_y_offset_mm=design.circle_y_offset_mm,
-            date_big=14,
-            date_small=9,
-            edition_size=8,
-            title_size=14,
-            tagline_size=9,
-            organised_by_size=6,
-            role_size=12,
-        )
+    d = Design(
+        bg_black=cfg["bg_black"],
+        band_color=cfg["band_color"],
+        accent=cfg["accent"],
+        circle_d_mm=cfg["circle_d_mm"],
+        circle_y_offset_mm=cfg["circle_y_offset_mm"],
+    )
 
     out = io.BytesIO()
     c = canvas.Canvas(out, pagesize=(page_w, page_h))
 
     rows = df.to_dict(orient="records")
-    step = len(positions)  # 2 ou 4 badges par page
+    step = 4
 
-    def draw_page_recto(start_idx: int):
+    def draw_recto_page(start_idx: int):
         idx = start_idx
-        for p, (px, py) in enumerate(positions):
+        for pos in positions:
             if idx >= len(rows):
                 break
-            draw_recto(c, fonts, local_design, px, py, badge_w, badge_h, cfg, rows[idx], center_img, sponsor_imgs)
+            px, py = pos
+            draw_recto(c, fonts, d, px, py, bw, bh, cfg, rows[idx], center_img, sponsor_imgs)
             if cfg["cut_marks"]:
-                cut_marks(c, px, py, badge_w, badge_h)
+                draw_cut_marks(c, px, py, bw, bh)
             idx += 1
 
-    def draw_page_verso(_start_idx: int):
-        # verso identique pour tous (contacts), pas dépendant des personnes
-        for (px, py) in positions:
-            draw_verso(c, fonts, local_design, px, py, badge_w, badge_h, cfg)
+    def draw_verso_page():
+        for px, py in positions:
+            draw_verso(c, fonts, d, px, py, bw, bh, cfg)
             if cfg["cut_marks"]:
-                cut_marks(c, px, py, badge_w, badge_h)
+                draw_cut_marks(c, px, py, bw, bh)
 
     i = 0
     while i < len(rows):
-        if cfg["mode"] == "Recto seul":
-            draw_page_recto(i)
+        if cfg["export_mode"] == "Recto seul":
+            draw_recto_page(i)
             c.showPage()
-        elif cfg["mode"] == "Verso seul":
-            draw_page_verso(i)
+        elif cfg["export_mode"] == "Verso seul":
+            draw_verso_page()
             c.showPage()
-        else:  # Recto puis Verso
-            draw_page_recto(i)
+        else:  # Recto puis verso
+            draw_recto_page(i)
             c.showPage()
-            draw_page_verso(i)
+            draw_verso_page()
             c.showPage()
-
         i += step
 
     c.save()
@@ -527,7 +490,7 @@ def generate_pdf(df: pd.DataFrame, cfg: dict, design: BadgeDesign, sponsor_imgs:
 
 
 # =========================
-# UI
+# STREAMLIT UI
 # =========================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
@@ -542,25 +505,25 @@ if not CENTER_IMAGE_PATH.exists():
     st.stop()
 
 fonts, font_status = ensure_fonts()
-st.caption(f"Police utilisée pour le PDF : **{font_status}**")
+st.caption(f"Police PDF : **{font_status}**")
 
-with st.expander("Image recto (fixe) utilisée pour tous les badges", expanded=False):
+with st.expander("Image microscope utilisée (fixe)", expanded=False):
     st.image(Image.open(CENTER_IMAGE_PATH), use_container_width=True)
 
-left, right = st.columns([1.2, 1])
+left, right = st.columns([1.15, 1])
 
 with left:
-    st.subheader("1) Données participants")
-    file = st.file_uploader("CSV ou Excel", type=["csv", "xlsx"])
+    st.subheader("1) Participants")
+    f = st.file_uploader("CSV ou Excel", type=["csv", "xlsx"])
     df = None
-    if file is not None:
-        df = pd.read_csv(file) if file.name.lower().endswith(".csv") else pd.read_excel(file)
+    if f is not None:
+        df = pd.read_csv(f) if f.name.lower().endswith(".csv") else pd.read_excel(f)
         st.dataframe(df.head(20), use_container_width=True)
 
 with right:
     st.subheader("2) Logos sponsors (optionnel)")
-    sponsors_up = st.file_uploader("Logos (PNG conseillé) — multiple", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
-    sponsor_imgs = [Image.open(f) for f in sponsors_up] if sponsors_up else []
+    logos_up = st.file_uploader("Upload logos (PNG conseillé)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+    sponsor_imgs = [Image.open(x) for x in logos_up] if logos_up else []
 
     st.subheader("3) Couleurs")
     bg_black = st.color_picker("Fond haut", BLACK)
@@ -569,57 +532,75 @@ with right:
 
 st.divider()
 
-st.subheader("4) Mise en page A4 + export")
-layout = st.selectbox("A4 uniquement : choisis la taille", ["A4 paysage — 2 badges (GRAND)", "A4 portrait — 4 badges (PETIT)"], index=0)
-mode = st.selectbox("Export", ["Recto puis Verso", "Recto seul", "Verso seul"], index=0)
-page_margin_mm = st.number_input("Marge page (mm)", 0, 20, 6)
-gap_mm = st.number_input("Espace entre badges (mm)", 0, 20, 6)
-cutm = st.checkbox("Traits de coupe", True)
+st.subheader("4) Export A4 (4×A6) — taille print-safe")
+export_mode = st.selectbox("Export", ["Recto puis verso", "Recto seul", "Verso seul"], index=0)
+page_margin_mm = st.number_input("Marge page (mm) — mets 0 si tu veux maxi", 0, 12, 2)
+gap_mm = st.number_input("Espace entre badges (mm)", 0, 12, 2)
+cut_marks = st.checkbox("Traits de coupe", True)
 
 st.divider()
-st.subheader("5) Recto — blocs")
+st.subheader("5) Recto — contenu & mise en page")
 
 c1, c2, c3 = st.columns(3)
 with c1:
-    show_date = st.checkbox("Afficher la date (haut gauche)", True)
+    show_date = st.checkbox("Date (haut gauche)", True)
     date_l1 = st.text_input("Date L1", "Mardi 18")
     date_l2 = st.text_input("Date L2", "Février")
     date_l3 = st.text_input("Date L3", "2026")
 
+    show_edition = st.checkbox("Edition (haut droite)", True)
+    edition_text = st.text_input("Texte édition", "1ere édition")
+
+with c2:
+    show_event_title = st.checkbox("Nom évènement (gros, lisible)", True)
+    event_title = st.text_area("Nom évènement (1 ligne = 1 ligne)", "Grand Patrie", height=70)
+    event_title_size = st.slider("Taille nom évènement", 12, 28, 18)
+
+    show_baseline = st.checkbox("Baseline", True)
+    baseline = st.text_input("Baseline", "L'avenir de demain")
+    baseline_size = st.slider("Taille baseline", 7, 16, 10)
+
+with c3:
+    circle_d_mm = st.slider("Diamètre image microscope (mm)", 40, 80, 58)
+    circle_y_offset_mm = st.slider("Décalage vertical image (mm)", -25, 25, -2)
+
     remove_black_bg = st.checkbox("Retirer fond noir de l'image", True)
     black_threshold = st.slider("Seuil noir→transparent", 5, 60, 18)
 
-with c2:
-    show_edition = st.checkbox("Afficher édition (haut droite)", True)
-    edition_text = st.text_input("Texte édition", "1ere édition")
+st.divider()
+st.subheader("6) Bande basse (catégorie / nom / texte fixe) + Mapping colonnes")
 
-    show_title = st.checkbox("Afficher titre au centre", True)
-    event_title = st.text_area("Titre (1 ligne = 1 ligne)", "Grand Patrie", height=80)
+if df is None:
+    st.info("Charge un fichier participants pour activer le mapping et la génération.")
+    st.stop()
 
-    show_tagline = st.checkbox("Afficher tagline", True)
-    event_tagline = st.text_input("Tagline", "L'avenir de demain")
+cols = list(df.columns)
 
-with c3:
-    show_sponsors = st.checkbox("Afficher logos sponsors", True)
-    show_organised_by = st.checkbox("Afficher “Organisé par”", True)
-    organised_by_label = st.text_input("Libellé", "Organisé par")
-    max_sponsors = st.slider("Max logos", 1, 8, 4)
+m1, m2 = st.columns(2)
+with m1:
+    first_col = st.selectbox("Colonne prénom", cols, index=cols.index("prenom") if "prenom" in cols else 0)
+    last_col = st.selectbox("Colonne nom", cols, index=cols.index("nom") if "nom" in cols else 0)
+with m2:
+    role_col = st.selectbox("Colonne catégorie (INTERVENANT/...) ", cols, index=cols.index("categorie") if "categorie" in cols else 0)
 
-    circle_d_mm = st.slider("Diamètre image (mm)", 40, 85, 62)
-    circle_y_offset_mm = st.slider("Décalage vertical image (mm)", -30, 30, -6)
+band_show = st.checkbox("Afficher texte dans la bande basse", True)
+band_mode = st.selectbox("Contenu de la bande basse", ["Catégorie (colonne)", "Nom complet", "Texte fixe"], index=0)
+band_custom = st.text_input("Texte fixe", "INTERVENANT")
+band_text_size = st.slider("Taille texte bande", 9, 18, 12)
 
 st.divider()
-st.subheader("6) Bande basse (catégorie) — plus de débordement")
+st.subheader("7) Sponsors (optionnel)")
 
-role_source = st.selectbox("Source du texte bande basse", ["Colonne du fichier", "Texte fixe"], index=0)
-role_fixed = st.text_input("Texte fixe (ex: INTERVENANT)", "INTERVENANT")
-show_role_band = st.checkbox("Afficher la bande basse", True)
+show_sponsors = st.checkbox("Afficher logos sponsors", True)
+show_organised_by = st.checkbox("Afficher “Organisé par”", True)
+organised_by_label = st.text_input("Libellé", "Organisé par")
+max_sponsors = st.slider("Max logos", 1, 8, 3)
 
 st.divider()
-st.subheader("7) Verso — sections (ce que tu saisis = ce qui sort)")
+st.subheader("8) Verso — sections (ça sort exactement comme saisi)")
 
 back_show_event_name = st.checkbox("Verso : afficher nom évènement en haut", False)
-back_event_name = st.text_input("Nom évènement (verso)", "Grand Patrie")
+back_event_name = st.text_input("Verso : nom évènement", "Grand Patrie")
 
 sec1, sec2 = st.columns(2)
 default_sections = [
@@ -628,37 +609,24 @@ default_sections = [
     ("PARTENAIRES", "Justine COUTEILLE\n+33 6 75 58 75 32\nCharlotte M’NASRI\n+33 6 74 47 11 99"),
     ("ÉDITORIAL", "Romain GONZALEZ\n+33 7 69 26 95 89"),
 ]
-
 back_sections = []
 for i, (t, content) in enumerate(default_sections):
     col = sec1 if i % 2 == 0 else sec2
     with col:
-        show = st.checkbox(f"Afficher {t}", value=True, key=f"sec_show_{i}")
+        show = st.checkbox(f"Afficher {t}", True, key=f"sec_show_{i}")
         title = st.text_input(f"Titre {i+1}", t, key=f"sec_title_{i}")
-        text = st.text_area(f"Contenu {i+1}", content, height=120, key=f"sec_text_{i}")
-        back_sections.append({"show": show, "title": title, "lines": text})
+        txt = st.text_area(f"Contenu {i+1}", content, height=110, key=f"sec_txt_{i}")
+        back_sections.append({"show": show, "title": title, "lines": txt})
 
 back_show_hashtag = st.checkbox("Verso : afficher hashtag", True)
 back_hashtag = st.text_input("Hashtag", "#Demain c'est top")
 
-st.divider()
-st.subheader("8) Mapping colonnes (pour la catégorie si tu la prends du fichier)")
-
-if df is None:
-    st.info("Charge un fichier pour activer la génération.")
-    st.stop()
-
-cols = list(df.columns)
-role_col = st.selectbox("Colonne catégorie (ex: INTERVENANT)", cols, index=cols.index("categorie") if "categorie" in cols else 0)
-
-st.divider()
-
+# Build cfg
 cfg = {
-    "layout": layout,
-    "mode": mode,
+    "export_mode": export_mode,
     "page_margin_mm": float(page_margin_mm),
     "gap_mm": float(gap_mm),
-    "cut_marks": cutm,
+    "cut_marks": cut_marks,
 
     "bg_black": bg_black,
     "band_color": band_color,
@@ -669,28 +637,35 @@ cfg = {
     "date_l2": date_l2,
     "date_l3": date_l3,
 
-    "remove_black_bg": remove_black_bg,
-    "black_threshold": int(black_threshold),
-
     "show_edition": show_edition,
     "edition_text": edition_text,
 
-    "show_title": show_title,
+    "show_event_title": show_event_title,
     "event_title": event_title,
-    "show_tagline": show_tagline,
-    "event_tagline": event_tagline,
+    "event_title_size": int(event_title_size),
+
+    "show_baseline": show_baseline,
+    "baseline": baseline,
+    "baseline_size": int(baseline_size),
+
+    "circle_d_mm": float(circle_d_mm),
+    "circle_y_offset_mm": float(circle_y_offset_mm),
+
+    "remove_black_bg": remove_black_bg,
+    "black_threshold": int(black_threshold),
 
     "show_sponsors": show_sponsors,
     "show_organised_by": show_organised_by,
     "organised_by_label": organised_by_label,
     "max_sponsors": int(max_sponsors),
 
-    "circle_d_mm": float(circle_d_mm),
-    "circle_y_offset_mm": float(circle_y_offset_mm),
+    "band_show": band_show,
+    "band_mode": band_mode,
+    "band_custom": band_custom,
+    "band_text_size": int(band_text_size),
 
-    "show_role_band": show_role_band,
-    "role_source": role_source,
-    "role_fixed": role_fixed,
+    "first_col": first_col,
+    "last_col": last_col,
     "role_col": role_col,
 
     "back_show_event_name": back_show_event_name,
@@ -700,24 +675,16 @@ cfg = {
     "back_hashtag": back_hashtag,
 }
 
-design = BadgeDesign(
-    bg_black=bg_black,
-    band_color=band_color,
-    accent=accent,
-    circle_d_mm=float(circle_d_mm),
-    circle_y_offset_mm=float(circle_y_offset_mm),
-)
-
 if st.button("Générer PDF"):
     try:
-        pdf_bytes = generate_pdf(df=df, cfg=cfg, design=design, sponsor_imgs=sponsor_imgs)
+        pdf_bytes = generate_pdf(df=df, cfg=cfg, sponsor_imgs=sponsor_imgs)
 
         st.success("PDF généré.")
-        st.download_button("Télécharger le PDF", data=pdf_bytes, file_name="badges_A4_recto_verso.pdf", mime="application/pdf")
+        st.download_button("Télécharger le PDF", data=pdf_bytes, file_name="badges_A4_4xA6_recto_verso.pdf", mime="application/pdf")
 
-        # affichage intégré (si downloads bloqués)
+        # Affichage inline (utile si download bloqué)
         b64 = base64.b64encode(pdf_bytes).decode("utf-8")
         components.html(f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="900"></iframe>', height=920)
 
     except Exception as e:
-        st.error(f"Erreur: {e}")
+        st.error(f"Erreur : {e}")
